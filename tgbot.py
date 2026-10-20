@@ -1,10 +1,15 @@
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
 import threading
 import time
 from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from telebot import TeleBot, types
 
@@ -39,8 +44,11 @@ from btns import (
     savollar_menu,
 )
 
-TOKEN = os.getenv("BOT_TOKEN", "8834396024:AAGfRwMVjMJvqJ5mZj4rjPIzAMmxi-nMQFw")
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_NAME = os.getenv("BOT_DB", "bot.db")
+WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
+WEBAPP_PORT = int(os.getenv("PORT", os.getenv("WEBAPP_PORT", "8080")))
+WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
 
 # --- Admin panel sozlamalari ---
 # Admin panelga faqat shu login/parol bilan kirish mumkin.
@@ -57,7 +65,7 @@ bot = TeleBot(token=TOKEN)
 
 
 class SessionDict(dict):
-    
+
 
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
@@ -79,6 +87,15 @@ def now():
 
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def is_valid_password(password):
+    return (
+        len(password) >= 8
+        and any(ch.isupper() for ch in password)
+        and any(ch.isdigit() for ch in password)
+        and not password.isdigit()
+    )
 
 
 def get_db():
@@ -716,6 +733,200 @@ def send_question_to_teachers(question_id, student_id, subject, question_type, q
     bot.send_message(student_id, "Savolingiz saqlandi. Bo'sh ustozlarga xabar yuborildi.")
 
 
+# ------------------ Mini App API ------------------
+
+def get_mini_app_user(init_data):
+    """Telegram WebApp initData imzosini tekshiradi va undagi userni qaytaradi."""
+    fields = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = fields.pop("hash", "")
+    if not received_hash:
+        return None
+
+    check_string = "\n".join(f"{key}={fields[key]}" for key in sorted(fields))
+    secret = hmac.new(b"WebAppData", TOKEN.encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret, check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(received_hash, expected_hash):
+        return None
+
+    try:
+        user = json.loads(fields.get("user", "{}"))
+        return user if user.get("id") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def ensure_mini_app_user(user):
+    user_id = int(user["id"])
+    name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part).strip()
+    name = name or user.get("username") or str(user_id)
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO users (user_id, name, role, created_at)
+            VALUES (?, ?, 'student', ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, name, now()),
+        )
+    return user_id
+
+
+def mini_app_snapshot(user):
+    user_id = ensure_mini_app_user(user)
+    with get_db() as db:
+        profile = db.execute("SELECT name, role FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        teacher = db.execute(
+            """
+            SELECT subject, is_free, rating_total, rating_count, helped_count
+            FROM teachers WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        questions = db.execute(
+            """
+            SELECT id, subject, question_text, status, created_at
+            FROM questions
+            WHERE student_id = ?
+            ORDER BY id DESC
+            LIMIT 30
+            """,
+            (user_id,),
+        ).fetchall()
+    snapshot = {
+        "user": {"id": user_id, "name": profile["name"], "role": profile["role"]},
+        "questions": [dict(row) for row in questions],
+    }
+    if teacher:
+        rating = teacher["rating_total"] / teacher["rating_count"] if teacher["rating_count"] else None
+        snapshot["teacher"] = {
+            "subject": teacher["subject"],
+            "is_free": bool(teacher["is_free"]),
+            "rating": rating,
+            "helped_count": teacher["helped_count"],
+        }
+    return snapshot
+
+
+class MiniAppRequestHandler(BaseHTTPRequestHandler):
+    server_version = "NomiyoMiniApp/1.0"
+
+    def log_message(self, _format, *_args):
+        return
+
+    def send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 10000:
+                return None
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+
+    def telegram_user(self):
+        user = get_mini_app_user(self.headers.get("X-Telegram-Init-Data", ""))
+        if not user:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Telegram tasdiqlashi topilmadi."})
+        return user
+
+    def serve_static(self, path):
+        relative_path = "index.html" if path == "/" else unquote(path).lstrip("/")
+        candidate = (WEBAPP_DIR / relative_path).resolve()
+        if WEBAPP_DIR not in candidate.parents or not candidate.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        mime_types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+        body = candidate.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime_types.get(candidate.suffix, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/bootstrap":
+            user = self.telegram_user()
+            if user:
+                self.send_json(HTTPStatus.OK, mini_app_snapshot(user))
+            return
+        self.serve_static(path)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ("/api/questions", "/api/teacher/availability"):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        user = self.telegram_user()
+        if not user:
+            return
+        payload = self.read_json() or {}
+        if path == "/api/teacher/availability":
+            user_id = ensure_mini_app_user(user)
+            is_free = payload.get("is_free")
+            if not isinstance(is_free, bool):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Holat noto'g'ri."})
+                return
+            with get_db() as db:
+                updated = db.execute(
+                    "UPDATE teachers SET is_free = ? WHERE user_id = ?", (int(is_free), user_id)
+                ).rowcount
+                teacher = db.execute("SELECT subject FROM teachers WHERE user_id = ?", (user_id,)).fetchone()
+            if not updated:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Ustoz profili topilmadi."})
+                return
+            if is_free and teacher:
+                notify_free_teacher_of_backlog(user_id, teacher["subject"])
+            self.send_json(HTTPStatus.OK, {"is_free": is_free})
+            return
+
+        subject = str(payload.get("subject", "")).strip()
+        question_text = str(payload.get("question_text", "")).strip()
+        if subject not in set(SUBJECTS.values()) or not 5 <= len(question_text) <= 1200:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Savol yoki fan noto'g'ri."})
+            return
+
+        user_id = ensure_mini_app_user(user)
+        question_id = save_question(user_id, subject, "text", question_text=question_text)
+        send_question_to_teachers(question_id, user_id, subject, "text", question_text=question_text)
+        with get_db() as db:
+            question = db.execute(
+                "SELECT id, subject, question_text, status, created_at FROM questions WHERE id = ?", (question_id,)
+            ).fetchone()
+        self.send_json(HTTPStatus.CREATED, {"question": dict(question)})
+
+    def do_PUT(self):
+        if urlparse(self.path).path != "/api/profile":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        user = self.telegram_user()
+        if not user:
+            return
+        payload = self.read_json() or {}
+        name = str(payload.get("name", "")).strip()
+        if not 1 <= len(name) <= 60:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Ism 1 dan 60 belgigacha bo'lishi kerak."})
+            return
+        user_id = ensure_mini_app_user(user)
+        with get_db() as db:
+            db.execute("UPDATE users SET name = ? WHERE user_id = ?", (name, user_id))
+        self.send_json(HTTPStatus.OK, {"name": name})
+
+
+def start_mini_app_server():
+    httpd = ThreadingHTTPServer((WEBAPP_HOST, WEBAPP_PORT), MiniAppRequestHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"[UyVazifa] Mini App API http://{WEBAPP_HOST}:{WEBAPP_PORT} manzilida ishga tushdi.")
+
+
 def notify_teacher_about_question(teacher_id, question):
     """Bitta ustozga (masalan, endigina 'Bo'shman' bosgan ustozga)
     kutib turgan bitta savol haqida xabar beradi."""
@@ -1003,6 +1214,43 @@ def help_entry(msg: types.Message):
     bot.send_message(user_id, "\n".join(lines))
 
 
+@bot.message_handler(content_types=["web_app_data"])
+def web_app_data_handler(msg: types.Message):
+    user_id = msg.from_user.id
+
+    try:
+        payload = json.loads(msg.web_app_data.data or "{}")
+    except (TypeError, ValueError):
+        bot.send_message(user_id, "Mini App ma'lumoti noto'g'ri keldi. Iltimos, qaytadan urinib ko'ring.")
+        return
+
+    if payload.get("action") != "submit_question":
+        bot.send_message(user_id, "Mini App'dan noma'lum amal keldi.")
+        return
+
+    subject = str(payload.get("subject", "")).strip()
+    question_text = str(payload.get("question_text", "")).strip()
+    valid_subjects = set(SUBJECTS.values())
+
+    if subject not in valid_subjects:
+        bot.send_message(user_id, "Fan noto'g'ri tanlangan. Iltimos, Mini App orqali qaytadan tanlang.")
+        return
+
+    if len(question_text) < 5:
+        bot.send_message(user_id, "Savol juda qisqa. Iltimos, savolni batafsilroq yozing.")
+        return
+
+    if len(question_text) > 1200:
+        question_text = question_text[:1200]
+
+    if not get_user(user_id):
+        save_user(msg, role="student")
+
+    question_id = save_question(user_id, subject, "text", question_text=question_text)
+    send_question_to_teachers(question_id, user_id, subject, "text", question_text=question_text)
+    bot.send_message(user_id, "Mini App orqali yuborilgan savolingiz qabul qilindi.", reply_markup=oquvchi_menu)
+
+
 @bot.message_handler(content_types=["text"])
 def message_handler(msg: types.Message):
     user_id = msg.from_user.id
@@ -1204,13 +1452,21 @@ def message_handler(msg: types.Message):
             return
 
         user_states[user_id] = {"full_name": state.get("full_name"), "login": login_value, "step": "waiting_password"}
-        bot.send_message(user_id, "Ajoyib! Endi parol o'ylab toping (kamida 4 belgi):")
+        bot.send_message(
+            user_id,
+            "Ajoyib! Endi parol o'ylab toping: kamida 8 ta belgi, kamida 1 ta katta harf "
+            "va kamida 1 ta son bo'lsin. Parol faqat sonlardan iborat bo'lmasin.",
+        )
         return
 
     if state.get("step") == "waiting_password":
         password_value = text.strip()
-        if len(password_value) < 4:
-            bot.send_message(user_id, "Parol kamida 4 belgidan iborat bo'lishi kerak. Qaytadan kiriting:")
+        if not is_valid_password(password_value):
+            bot.send_message(
+                user_id,
+                "Parol berilgan talablarga mos emas. Kamida 8 ta belgi, kamida 1 ta katta harf "
+                "va kamida 1 ta son ishlating. Parol faqat sonlardan iborat bo'lmasin. Qaytadan kiriting:",
+            )
             return
 
         save_user(
@@ -1701,7 +1957,10 @@ def check_stale_chats():
 
 
 if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is required")
     init_db()
     restore_runtime_state()
+    start_mini_app_server()
     threading.Thread(target=check_stale_chats, daemon=True).start()
     bot.polling(none_stop=True)

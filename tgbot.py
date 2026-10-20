@@ -49,6 +49,7 @@ DB_NAME = os.getenv("BOT_DB", "bot.db")
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(os.getenv("PORT", os.getenv("WEBAPP_PORT", "8080")))
 WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
+WEBAPP_ORIGIN = os.getenv("WEBAPP_ORIGIN", MINI_APP_URL).rstrip("/")
 
 # --- Admin panel sozlamalari ---
 # Admin panelga faqat shu login/parol bilan kirish mumkin.
@@ -819,6 +820,10 @@ class MiniAppRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if WEBAPP_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", WEBAPP_ORIGIN)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Telegram-Init-Data")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
 
@@ -859,6 +864,14 @@ class MiniAppRequestHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.OK, mini_app_snapshot(user))
             return
         self.serve_static(path)
+
+    def do_OPTIONS(self):
+        self.send_response(HTTPStatus.NO_CONTENT)
+        if WEBAPP_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", WEBAPP_ORIGIN)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Telegram-Init-Data")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.end_headers()
 
     def do_POST(self):
         path = urlparse(self.path).path

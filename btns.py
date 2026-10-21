@@ -8,7 +8,7 @@ from telebot import types
 # Bo'sh bo'lsa, "📱 Mini App" tugmasi hech qayerda ko'rinmaydi —
 # ya'ni hali sozlamagan bo'lsangiz ham bot xatosiz ishlayveradi.
 MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
-MINI_APP_LABEL = "📱 Mini App"
+# MINI_APP_LABEL = "📱 Mini App"
 
 ROLE_TEACHER = "👨‍🏫 O'qituvchi"
 ROLE_STUDENT = "🎓 O'quvchi"
